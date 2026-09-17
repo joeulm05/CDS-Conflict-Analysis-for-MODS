@@ -1,0 +1,151 @@
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>CDS UE4SS Mod Conflict Analyzer</title><script src='https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js'></script><style>body{font-family:Segoe UI,Arial;background:#0b1118;color:#eef4fb;margin:0}main{max-width:1200px;margin:auto;padding:24px}.card{background:#141d28;border:1px solid #2b3b4e;border-radius:14px;padding:18px;margin-bottom:14px}.drop{border:2px dashed #40566e;padding:30px;text-align:center;border-radius:12px;cursor:pointer}.drop.drag{border-color:#5aa7ff}.muted{color:#9fb0c3}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}button{background:#1d2b3a;color:#fff;border:1px solid #2b3b4e;border-radius:8px;padding:10px 13px;cursor:pointer}button:disabled{opacity:.4}.grid{display:grid;grid-template-columns:.75fr 1.25fr;gap:14px}.file,.finding{padding:10px;border-bottom:1px solid #263547}.finding{border:1px solid #405064;border-radius:10px;margin:8px 0}.high{background:#351719;border-color:#873238}.medium{background:#382416;border-color:#89572b}.low{background:#332e17;border-color:#80702e}.info{background:#14283a}.tag{font-weight:700}.stats{display:flex;gap:8px;flex-wrap:wrap}.stat{background:#1a2634;border:1px solid #2b3b4e;padding:9px;border-radius:8px}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.tabs button.active{background:#31577e}.section{display:none}.section.active{display:block}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c131b;padding:9px;border-radius:7px;color:#cfe0ef}@media(max-width:800px){.grid{grid-template-columns:1fr}}</style></head><body><main>
+<div class='card'><h1>CDS UE4SS Mod Conflict Analyzer — Deep Review</h1><p class='muted'>Drop complete mod ZIP folders. Analysis stays in your browser. It detects possible shared hooks, shared systems, hotkey collisions, recurring work, delayed callbacks, inventory mutation, broad UMG hooks, and runtime object construction.</p><div id='drop' class='drop'><b>Drop mod ZIPs here</b><br><span class='muted'>or click to choose as many as you want</span></div><input id='pick' type='file' multiple accept='.zip' hidden><div class='row'><button id='analyze' disabled>Analyze Mods</button><button id='clear'>Clear</button><button id='copy' disabled>Copy Report</button><button id='download' disabled>Download Report</button></div><p class='muted'><b>Important:</b> Static analysis finds possible conflicts; it cannot prove a crash. Runtime reproduction, logs, and crash dumps remain authoritative.</p></div>
+<div class='grid'><div class='card'><h2>Loaded Mods</h2><div id='files' class='muted'>No ZIPs loaded.</div></div><div class='card'><h2>Analysis</h2><div id='status' class='muted'>Load ZIPs and click Analyze Mods.</div><div id='stats' class='stats'></div><div id='tabs' class='tabs' hidden><button data-tab='cross' class='active'>Cross-Mod</button><button data-tab='individual'>Individual</button><button data-tab='hooks'>Hook Map</button><button data-tab='systems'>System Map</button><button data-tab='recommend'>Recommendations</button></div><div id='cross' class='section active'></div><div id='individual' class='section'></div><div id='hooks' class='section'></div><div id='systems' class='section'></div><div id='recommend' class='section'></div></div></div>
+<script>
+const $=x=>document.getElementById(x);let chosen=[],report='';const sys=['PlayerStorage','Storage','Inventory','Economy','Automation','Scanner','RadialMenu','Tablet','Computer','Shop','Vehicle','Worker','Garage','Odometer','SideEvent','EventHandler','UMG.Widget','Repair','Fuel','Bills','NPC','Parking','Save'];
+const rex={hook:/RegisterHook\s*\(\s*["']([^"']+)["']/g,key:/RegisterKeyBind\s*\(\s*(?:Key\.|)([A-Za-z0-9_]+)/g,delay:/ExecuteInGameThreadWithDelay\s*\(/g,loop:/(?:LoopInGameThreadWithDelay|ExecuteWithDelay)\s*\(/g,remove:/[:.]RemoveItem\s*\(/g,add:/[:.]AddItem\s*\(/g,construct:/StaticConstructObject\s*\(/g,valid:/[:.]IsValid\s*\(/g};
+function matches(r,t){r.lastIndex=0;let a=[],m;while((m=r.exec(t)))a.push(m[1]||m[0]);return [...new Set(a)]}function count(r,t){r.lastIndex=0;let n=0;while(r.exec(t))n++;return n}function name(f){return f.name.replace(/\.zip$/i,'')}function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function render(){if(!chosen.length){$('files').innerHTML='No ZIPs loaded.';return}$('files').innerHTML=chosen.map((f,i)=>`<div class='file'><b>${esc(name(f))}</b> <button data-r='${i}'>Remove</button></div>`).join('');document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{chosen.splice(+b.dataset.r,1);render();$('analyze').disabled=!chosen.length})}function add(fs){for(const f of fs)if(/\.zip$/i.test(f.name)&&!chosen.some(x=>x.name===f.name&&x.size===f.size))chosen.push(f);render();$('analyze').disabled=!chosen.length}
+$('drop').onclick=()=>$('pick').click();$('pick').onchange=e=>add(e.target.files);['dragenter','dragover'].forEach(x=>$('drop').addEventListener(x,e=>{e.preventDefault();$('drop').classList.add('drag')}));['dragleave','drop'].forEach(x=>$('drop').addEventListener(x,e=>{e.preventDefault();$('drop').classList.remove('drag')}));$('drop').addEventListener('drop',e=>add(e.dataTransfer.files));
+function lineAt(t,i){return t.slice(0,i).split(/\r?\n/).length}
+function ctx(t,i,r=2){let a=t.split(/\r?\n/),n=lineAt(t,i),x=Math.max(0,n-1-r),y=Math.min(a.length,n+r);return{line:n,snippet:a.slice(x,y).map((v,k)=>`${x+k+1}: ${v}`).join("\n")}}
+function deepFile(path,t){let out=[],m,re;const add=(level,label,i,why,fix)=>{let c=ctx(t,i);out.push({level,label,path,line:c.line,snippet:c.snippet,why,fix})};
+ re=/if\s+true\s+or\s+/g;while((m=re.exec(t)))add('high','ALWAYS-TRUE CONDITION',m.index,'This guard can never be false, so a config option or safety condition may be bypassed.','Remove the leading `true or` and evaluate only the intended condition.');
+ re=/RegisterHook\s*\(\s*["'](\/Script\/UMG\.Widget:[^"']+)["']/g;while((m=re.exec(t)))add('medium','BROAD UMG HOOK',m.index,'A base UMG.Widget hook can fire for a very large number of widgets, adding overhead and cross-mod interaction risk.','Hook the narrowest concrete widget UFunction available; otherwise filter immediately by class/name.');
+ re=/[:.]AddItem\s*\(/g;while((m=re.exec(t))){let tail=t.slice(m.index,m.index+1600);if(/[:.]RemoveItem\s*\(/.test(tail))add('high','NON-ATOMIC ITEM TRANSFER',m.index,'If destination AddItem succeeds and source RemoveItem fails, items can duplicate or containers can become inconsistent.','Prefer a native atomic transfer. Otherwise implement rollback, or use a verified remove-first transaction when game semantics allow it.')}
+ re=/ExecuteInGameThreadWithDelay\s*\([^,]+,\s*function\s*\([^)]*\)([\s\S]{0,1800}?)end\s*\)/g;while((m=re.exec(t))){let b=m[1];if(/\b(Vehicle|Scanner|Context|Widget|Storage|Manager|Player|Garage|Slot|Holder)\b/.test(b)&&!/(IsValid|FindFirstOf|FindAllOf)/.test(b))add('high','DELAYED UOBJECT REUSE',m.index,'A UObject-like wrapper may be dereferenced after its world or UI lifetime ended, causing intermittent invalid reads or native crashes.','Revalidate with `:IsValid()` inside the delayed callback or reacquire the current object by stable identity before use.')}
+ re=/(LoopInGameThreadWithDelay|ExecuteWithDelay)\s*\(/g;while((m=re.exec(t))){let n=t.slice(Math.max(0,m.index-900),m.index+2200);if(/FindAllOf|PlayerStorage|RemoveItem|AddItem/.test(n))add('medium','RECURRING GAMEPLAY SCAN',m.index,'Repeated enumeration/mutation can create frame hitches and can survive into unsafe world/save lifecycle windows.','Prefer a native event. If polling is required, reacquire objects every pass and invalidate old loops with a session/generation token.')}
+ re=/StaticConstructObject\s*\(/g;while((m=re.exec(t))){let n=t.slice(Math.max(0,m.index-1100),m.index+1500);if(!/Destruct|RemoveFromParent|existing|already|generation/i.test(n))add('medium','RUNTIME OBJECT LIFECYCLE',m.index,'Repeated runtime construction without obvious duplicate/teardown protection can duplicate UI or retain callback objects.','Use a stable identity, check for an existing injected object, and clear references on widget/world teardown.')}
+ re=/RegisterHook\s*\(/g;while((m=re.exec(t))){let n=t.slice(Math.max(0,m.index-650),m.index+650);if(!/pcall|retry|Retry|ExecuteWithDelay|ExecuteInGameThreadWithDelay/.test(n))add('low','COLD-START HOOK RISK',m.index,'The Blueprint UFunction may not exist yet when UE4SS starts, leaving the feature inactive on some cold boots.','Use safe registration plus bounded retry and an exactly-once registration guard.')}
+ return out}
+async function inspect(f){
+ const z=await JSZip.loadAsync(f);
+ let chunks=[],lua=0,deep=[],hookEvidence=[];
+ for(const [p,e] of Object.entries(z.files)){
+  if(e.dir||!/\.(lua|ini|txt)$/i.test(p))continue;
+  try{
+   const c=await e.async('string');
+   chunks.push('\n-- '+p+'\n'+c);
+   if(/\.lua$/i.test(p)){
+    lua++;
+    deep.push(...deepFile(p,c));
+    // Capture EVERY RegisterHook call. Resolve literal paths when possible,
+    // but keep dynamic/variable calls visible instead of silently dropping them.
+    let rr=/RegisterHook\s*\(\s*([^,\r\n]+)/g,mm;
+    while((mm=rr.exec(c))){
+     const cc=ctx(c,mm.index);
+     const arg=(mm[1]||'').trim();
+     const lm=arg.match(/^["']([^"']+)["']$/);
+     hookEvidence.push({
+      path:p,line:cc.line,
+      hook:lm?lm[1]:'<dynamic/unresolved> '+arg,
+      resolved:!!lm,
+      snippet:cc.snippet
+     });
+    }
+   }
+  }catch{}
+ }
+ const t=chunks.join('\n');
+ const resolvedHooks=[...new Set(hookEvidence.filter(h=>h.resolved).map(h=>h.hook))];
+ return {
+  name:name(f),lua,text:t,deep,hookEvidence,hooks:resolvedHooks,
+  keys:matches(rex.key,t),
+  systems:sys.filter(x=>t.toLowerCase().includes(x.toLowerCase())),
+  delays:count(rex.delay,t),loops:count(rex.loop,t),
+  removes:count(rex.remove,t),adds:count(rex.add,t),
+  constructs:count(rex.construct,t),valids:count(rex.valid,t)
+ };
+}
+function box(level,label,title,detail){return `<div class='finding ${level}'><div class='tag'>${esc(label)}</div><b>${esc(title)}</b><div class='muted'>${esc(detail)}</div></div>`}
+function recommendationCard(x){
+ const level=x[0]||'low', label=x[1]||'REVIEW', title=x[2]||'Unknown', detail=x[3]||'';
+ const evidence=x[4]||'', why=x[5]||'', fix=x[6]||'';
+ const priority=level==='high'?'CHANGE THIS FIRST':level==='medium'?'HARDEN THIS':'REVIEW / POLISH';
+ let verify='Re-run the original workflow after the change and compare behavior and UE4SS logs.';
+ if(label.includes('DELAYED')) verify='Repeat the action after closing/reopening the UI and after a save/world reload; confirm stale objects are never reused.';
+ else if(label.includes('TRANSACTION')||label.includes('ITEM TRANSFER')) verify='Force a partial transaction failure and confirm no item is duplicated, lost, or paid twice.';
+ else if(label.includes('LOOP')||label.includes('RECURRING')) verify='Load another save in the same process and confirm the previous loop generation stops and does not reschedule.';
+ else if(label.includes('UMG')) verify='Compare callback frequency/frame timing before and after narrowing the hook.';
+ else if(label.includes('COLD-START')) verify='Cold-launch the game multiple times and confirm the hook registers exactly once when its UFunction becomes available.';
+ else if(label.includes('ALWAYS-TRUE')) verify='Disable the related config/feature and confirm the guarded code no longer executes.';
+ else if(label.includes('RUNTIME OBJECT')) verify='Open and close the affected UI repeatedly and confirm only one injected object exists at a time.';
+ return `<div class='finding ${level}'>
+   <div class='tag'>${esc(priority)}</div>
+   <b>${esc(title)}</b>
+   <div style='margin-top:8px'><b>Finding:</b> ${esc(label)}</div>
+   ${detail?`<div class='muted' style='margin-top:4px'>${esc(detail)}</div>`:''}
+   ${why?`<div style='margin-top:7px'><b>Why it matters:</b> ${esc(why)}</div>`:''}
+   ${fix?`<div style='margin-top:7px'><b>What I would change:</b> ${esc(fix)}</div>`:''}
+   <div style='margin-top:7px'><b>How to verify:</b> ${esc(verify)}</div>
+   ${evidence?`<div style='margin-top:8px'><b>Code to inspect:</b><pre>${esc(evidence)}</pre></div>`:''}
+ </div>`;
+}
+
+$('analyze').onclick=async()=>{if(typeof JSZip==='undefined'){alert('JSZip did not load. Internet access is needed for this build.');return}$('status').textContent='Analyzing...';$('analyze').disabled=true;try{let mods=[];for(const f of chosen)mods.push(await inspect(f));let cross=[],ind=[];for(let i=0;i<mods.length;i++)for(let j=i+1;j<mods.length;j++){let a=mods[i],b=mods[j],h=a.hooks.filter(x=>b.hooks.includes(x)),k=a.keys.filter(x=>b.keys.includes(x)),s=a.systems.filter(x=>b.systems.includes(x));if(h.length)cross.push(['high','SHARED HOOK',a.name+' + '+b.name,h.join(' | ')]);if(k.length)cross.push(['high','HOTKEY COLLISION',a.name+' + '+b.name,k.join(', ')]);if(s.length>=2){let mut=(a.adds+a.removes>0)&&(b.adds+b.removes>0),timed=(a.loops+a.delays>0)||(b.loops+b.delays>0);cross.push([mut?'high':timed?'medium':'low',mut?'SHARED MUTATING SYSTEM':'SHARED SYSTEM',a.name+' + '+b.name,s.join(', ')])}}for(const m of mods){for(const d of m.deep)ind.push([d.level,d.label,`${m.name} — ${d.path}:${d.line}`,'Source-level heuristic',d.snippet,d.why,d.fix]);if(m.loops)ind.push(['medium','RECURRING WORK',m.name,`${m.loops} recurring loop pattern(s); review world/save lifetime.`]);if(m.delays&&!m.valids)ind.push(['high','DELAYED UOBJECT RISK',m.name,`${m.delays} delayed callbacks and no IsValid() calls detected.`]);if(m.adds&&m.removes)ind.push(['medium','INVENTORY MUTATION',m.name,`AddItem=${m.adds}, RemoveItem=${m.removes}; review transaction order/rollback.`]);if(m.constructs)ind.push(['low','RUNTIME CONSTRUCTION',m.name,`${m.constructs} StaticConstructObject call(s); review GC, ownership, duplicate injection.`]);if(m.hooks.some(h=>h.includes('/Script/UMG.Widget:')))ind.push(['medium','BROAD UMG HOOK',m.name,'Hooks a base UMG.Widget function; ensure immediate cheap filtering.'])}const rank={high:0,medium:1,low:2};cross.sort((a,b)=>rank[a[0]]-rank[b[0]]);ind.sort((a,b)=>rank[a[0]]-rank[b[0]]);$('stats').innerHTML=`<div class='stat'><b>${mods.length}</b> mods</div><div class='stat'><b>${mods.reduce((n,m)=>n+m.hookEvidence.length,0)}</b> hooks</div><div class='stat'><b>${cross.length}</b> cross-mod findings</div><div class='stat'><b>${ind.length}</b> individual warnings</div>`;$('tabs').hidden=false;$('cross').innerHTML=cross.length?cross.map(x=>box(...x)).join(''):`<p class='muted'>No cross-mod heuristics triggered.</p>`;$('individual').innerHTML=ind.length?ind.map(x=>box(...x)).join(''):`<p class='muted'>No individual heuristics triggered.</p>`;$('hooks').innerHTML=mods.map(m=>{
+ const resolved=m.hookEvidence.filter(h=>h.resolved).length;
+ const dynamic=m.hookEvidence.length-resolved;
+ return `<div class='finding info'><b>${esc(m.name)}</b><div class='muted'>${m.hookEvidence.length} RegisterHook call site(s) — ${resolved} literal/resolved, ${dynamic} dynamic/unresolved</div>${
+  m.hookEvidence.length
+   ? m.hookEvidence.map(h=>`<div style='margin-top:10px'><span class='tag'>${h.resolved?'RESOLVED HOOK':'DYNAMIC HOOK'}</span> <b>${esc(h.hook)}</b><div class='muted'>${esc(h.path)}:${h.line}</div><pre>${esc(h.snippet)}</pre></div>`).join('')
+   : `<div class='muted' style='margin-top:8px'>No direct RegisterHook(...) call sites detected in analyzed Lua files. This mod may use a wrapper/helper registrar; inspect its hook helper or registrar functions.</div>`
+ }</div>`;
+}).join('');$('systems').innerHTML=mods.map(m=>`<div class='finding info'><b>${esc(m.name)}</b><div class='muted'>${esc(m.systems.join(', ')||'No common CDS subsystem keywords detected')}</div></div>`).join('');let rec=[];
+  for(const m of mods){
+    // Prefer source-level deep findings when available.
+    for(const d of (m.deep||[])){
+      rec.push([d.level,d.label,`${m.name} — ${d.path}:${d.line}`,'Source-level recommendation',d.snippet||'',d.why||'',d.fix||'']);
+    }
+    // Always generate concrete architectural recommendations from detected metrics.
+    if(m.delays>0){
+      rec.push(['medium','DELAYED CALLBACK HARDENING',m.name,
+        `${m.delays} delayed game-thread callback(s) detected.`,
+        '',
+        'Objects captured before a delay may no longer belong to the current world or UI generation when the callback executes.',
+        'Reacquire or validate every UObject inside the delayed callback before dereferencing it. Prefer stable IDs/FullName strings across the delay instead of retaining wrappers.']);
+    }
+    if(m.loops>0){
+      rec.push(['medium','LOOP LIFECYCLE HARDENING',m.name,
+        `${m.loops} recurring loop pattern(s) detected.`,
+        '',
+        'A recurring loop can continue after a save/world transition and can repeatedly enumerate or mutate gameplay state.',
+        'Use a generation/session token. Reacquire UObjects on every pass, and make an old generation exit before doing work or rescheduling itself.']);
+    }
+    if(m.adds>0 && m.removes>0){
+      rec.push(['high','TRANSACTION SAFETY',m.name,
+        `AddItem=${m.adds}; RemoveItem=${m.removes}.`,
+        '',
+        'A multi-step inventory transfer can duplicate or lose state if only part of the transaction succeeds.',
+        'Prefer a native atomic transfer. Otherwise verify each step and implement rollback. Never assume AddItem + RemoveItem both succeeded.']);
+    }
+    if(m.constructs>0){
+      rec.push(['medium','RUNTIME OBJECT CLEANUP',m.name,
+        `${m.constructs} StaticConstructObject call(s) detected.`,
+        '',
+        'Runtime-created widgets/objects can duplicate or remain referenced across repeated UI openings.',
+        'Before construction, detect an existing instance. On UI/world teardown, clear retained references and unregister callbacks where applicable.']);
+    }
+    if((m.hookEvidence||[]).some(h=>String(h.hook).includes('/Script/UMG.Widget:'))){
+      rec.push(['medium','NARROW THE UMG HOOK',m.name,
+        'A base UMG.Widget hook was detected.',
+        '',
+        'Base-widget hooks can execute extremely frequently and increase frame-time and cross-mod interaction risk.',
+        'Hook the concrete CDS widget/UFunction instead. If a base hook is unavoidable, perform a cheap class/name rejection as the first callback operation.']);
+    }
+    if((m.hookEvidence||[]).some(h=>!h.resolved)){
+      rec.push(['low','RESOLVE DYNAMIC HOOK PATHS',m.name,
+        'One or more RegisterHook calls use dynamic/variable paths.',
+        '',
+        'Dynamic registrars are valid, but they make static conflict analysis and cold-start diagnosis harder.',
+        'Keep the registrar, but centralize hook path constants and log the final resolved path when registering. This makes conflicts and failed registrations diagnosable.']);
+    }
+  }
+  // Remove exact duplicate recommendations.
+  const seenRec=new Set();
+  rec=rec.filter(x=>{const k=[x[0],x[1],x[2],x[3]].join('|');if(seenRec.has(k))return false;seenRec.add(k);return true;});
+  rec.sort((a,b)=>({high:0,medium:1,low:2}[a[0]]??3)-({high:0,medium:1,low:2}[b[0]]??3));
+  $('recommend').innerHTML=rec.length
+    ? `<div class='note'><b>Action plan:</b> These are actual proposed changes generated from the analyzed source and detected architecture. They are ordered by priority and remain static-analysis recommendations, not proof of a crash.</div>`+rec.map(recommendationCard).join('')
+    : `<div class='finding info'><b>NO ACTIONABLE CHANGES GENERATED</b><div class='muted'>The analyzer did not detect a pattern for which it has a defensible code recommendation. Check Hook Map and System Map for manual review.</div></div>`;report=['CDS UE4SS MOD CONFLICT ANALYZER REPORT','',...mods.map(m=>`${m.name}: ${m.hookEvidence.length} RegisterHook call sites (${m.hooks.length} resolved literal paths); delays=${m.delays}; loops=${m.loops}; systems=${m.systems.join(', ')}`),'','CROSS-MOD FINDINGS:',...(cross.length?cross.map(x=>`[${x[0].toUpperCase()}] ${x[1]}: ${x[2]} — ${x[3]}`):['None detected.']),'','INDIVIDUAL WARNINGS:',...(ind.length?ind.map(x=>`[${x[0].toUpperCase()}] ${x[1]}: ${x[2]} — ${x[3]}${x[5]?' | Consequence: '+x[5]:''}${x[6]?' | Suggested change: '+x[6]:''}${x[4]?' | Evidence: '+x[4].replace(/\n/g,' / '):''}`):['None detected.']),'','Static analysis does not prove runtime conflict or crash.'].join('\n');$('copy').disabled=$('download').disabled=false;$('status').textContent=`Analysis complete. ${rec.length} actionable recommendation(s) generated.`}catch(e){$('status').textContent='Analysis failed: '+e.message}finally{$('analyze').disabled=!chosen.length}};
+$('clear').onclick=()=>{chosen=[];report='';render();$('analyze').disabled=$('copy').disabled=$('download').disabled=true;$('stats').innerHTML='';$('tabs').hidden=true;['cross','individual','hooks','systems','recommend'].forEach(x=>$(x).innerHTML='');$('status').textContent='Load ZIPs and click Analyze Mods.'};$('copy').onclick=async()=>{try{await navigator.clipboard.writeText(report);$('copy').textContent='Copied!';setTimeout(()=>$('copy').textContent='Copy Report',1000)}catch{alert(report)}};$('download').onclick=()=>{let b=new Blob([report],{type:'text/plain'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='CDS_Mod_Conflict_Report.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});
+</script></main></body></html>
